@@ -1,0 +1,42 @@
+{extend name="layouts/base" /}
+{block name="body_class"}cashier-body{/block}
+{block name="styles"}<link rel="stylesheet" href="/assets/css/cashier.css?v=20261025dynamic">{/block}
+{block name="content"}
+<section class="cashier-page" id="cashier" data-biz-no="{$biz_no|htmlspecialchars}" data-token="{$access_token|htmlspecialchars}">
+    <header class="cashier-header"><img class="mpay-logo" src="/assets/brand/mpay-logo.svg" alt="MPAY 码支付" width="120" height="30"><span id="cashier-status" class="cashier-status">正在读取订单</span></header>
+    <p id="cashier-test" class="cashier-test" hidden>测试订单，请勿付款。此订单的状态不代表实际收款结果。</p>
+    <h1 id="cashier-subject">收银台</h1>
+    <section id="cashier-result" class="cashier-result" role="status" aria-live="polite" hidden>
+        <span class="cashier-result-icon" aria-hidden="true"><i id="cashier-result-icon" class="layui-icon"></i></span>
+        <h2 id="cashier-result-title"></h2>
+        <p id="cashier-result-message" class="cashier-result-message"></p>
+        <p id="cashier-result-detail" class="cashier-result-detail"></p>
+    </section>
+    <div class="cashier-amount" id="cashier-amount-block" hidden><span id="cashier-amount-label">应付金额</span><strong><span class="cashier-currency">¥</span> <span id="cashier-amount">—</span></strong></div>
+    <section id="cashier-selection" hidden><h2>选择支付方式</h2><div id="cashier-methods" class="cashier-methods"></div></section>
+    <section id="cashier-payment" hidden></section>
+    <div id="cashier-notice" class="cashier-notice" role="status" aria-live="polite" hidden></div>
+    <div id="cashier-error" class="cashier-error" role="alert" hidden></div>
+    <div class="cashier-auxiliary">
+        <details class="cashier-order-details"><summary>订单信息</summary><div class="cashier-order">订单号 <span id="cashier-order-no"></span></div></details>
+        <div class="cashier-actions">
+            <button id="cashier-prepare" type="button" class="layui-btn" hidden>重新获取付款信息</button>
+            <button id="cashier-refresh" type="button" class="layui-btn layui-btn-primary">刷新支付结果</button>
+        </div>
+    </div>
+    <footer id="cashier-footer">付款后请等待系统确认，切勿重复付款。
+如需帮助，请联系商户并提供订单号。</footer>
+    <noscript><p class="cashier-error">请启用 JavaScript 后使用收银台，或联系商户查询订单。</p></noscript>
+</section>
+<script type="application/json" id="cashier-initial">{$initial_json|raw}</script>
+{/block}
+{block name="scripts"}
+<script src="/assets/qrcode-generator/qrcode.js"></script>
+<script src="/assets/qrcode-generator/qrcode_UTF8.js"></script>
+<script src="/assets/js/cashier-pages.js?v=20261012flow"></script>
+<script src="/assets/js/clipboard.js?v=20261014copy"></script>
+<script src="/assets/js/cashier-receipt.js?v=20261025dynamic"></script>
+<script src="/assets/js/cashier-bank-transfer.js?v=20261026brand"></script>
+<script src="/assets/js/cashier-jump.js?v=20261022autojump"></script>
+<script src="/assets/js/cashier.js?v=20261025bank"></script>
+{/block}

@@ -1,0 +1,37 @@
+*.log
+.env
+composer.phar
+.DS_Store
+Thumbs.db
+/.idea
+/.vscode
+/vendor
+/.settings
+/.buildpath
+/.project
+/.codegraph
+/.codex
+/docs/*
+!/docs/README.md
+!/docs/wiki/
+!/docs/paid-plugins/
+/docs/paid-plugins/*
+!/docs/paid-plugins/README.md
+!/docs/paid-plugins/delivery.json
+/runtime
+# 根目录部署、测试、诊断及验收工具仅在本地保留，不进入远程源码仓库。
+/tools
+/tests
+/deploy
+__pycache__/
+*.py[cod]
+/.env.*
+/runtime/*
+!/runtime/.gitignore
+/public/storage/
+/.playwright-mcp/
+/node_modules
+package.json
+package-lock.json
+# 本地代理协作约定保留在工作区，不发布到远程仓库。
+AGENTS.md

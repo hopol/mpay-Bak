@@ -1,0 +1,293 @@
+<?php
+declare(strict_types=1);
+
+namespace app\service\payment\epay;
+
+use RuntimeException;
+use app\common\base\BaseService;
+use app\common\constant\ApiResponseConstant;
+use app\common\constant\PaymentResultCode;
+use app\common\constant\RefundConstant;
+use app\common\constant\TradeConstant;
+use app\common\util\Clock;
+use app\common\util\Money;
+use app\exception\BusinessException;
+use app\exception\PaymentDefinitiveException;
+use app\model\payment\BizOrder;
+use app\model\payment\PayOrder;
+use app\model\payment\PaymentApp;
+use app\repository\payment\config\PaymentAppRepository;
+use app\repository\payment\trade\BizOrderRepository;
+use app\repository\payment\trade\PayOrderRepository;
+use app\service\payment\cashier\CashierService;
+use app\service\payment\config\PaymentAppCredentialService;
+use app\service\payment\order\PayOrderService;
+use app\service\payment\order\RefundService;
+use app\service\payment\plugin\PayOrderChannelDispatchService;
+use app\service\system\access\RequestRateLimiter;
+
+/**
+ * 易支付 V1 的认证及协议适配，不与后台 code=200 JSON 混用，不接受浏览器回跳作为到账确认。
+ * 原始参数先验签，再做业务规范化；下单、派发、只读查询各自保持已有的事务边界。
+ */
+final class EpayV1ProtocolService extends BaseService
+{
+    public function __construct(
+        private readonly PaymentAppRepository $apps,
+        private readonly PaymentAppCredentialService $credentials,
+        private readonly EpayV1Signer $signer,
+        private readonly EpayV1Validator $validator,
+        private readonly PayOrderService $orders,
+        private readonly RefundService $refunds,
+        private readonly PayOrderChannelDispatchService $dispatch,
+        private readonly BizOrderRepository $bizOrders,
+        private readonly PayOrderRepository $payOrders,
+        private readonly EpayV1MessageService $messages,
+        private readonly Clock $clock,
+        private readonly CashierService $cashier,
+        private readonly RequestRateLimiter $limiter,
+    ) {}
+
+    /**
+     * @param array<string|int,string> $raw 未 trim/截断/转换的原始表单标量。
+     * @param string|null $detectedDevice submit 的浏览器识别结果；mapi 传 null，设备从原始请求读取。
+     * @return array{trade_no:string,payurl:string,reused:bool} 内部跳转结果，Controller 再适配 submit/mapi。
+     */
+    public function create(
+        array $raw,
+        string $scene,
+        ?string $clientIp,
+        ?string $detectedDevice,
+        string $requestId,
+    ): array {
+        $identity = $this->authenticate($raw, true);
+        // 只有已验签的真实应用才消耗其额度，submit/mapi 共用同一个下单规则。
+        $this->limiter->check('epay_create', $identity['app']['id']);
+        $input = $this->validator->order(
+            $raw,
+            $scene,
+            $identity['app']['id'],
+            $identity['version'],
+            $clientIp,
+            $detectedDevice,
+        );
+        // 链接由框架按当前 Request 生成，不冻结为安装时的域名。
+        $created = $this->orders->create($input, $this->clock->now());
+        if ($created->payNo !== null) {
+            $pay = $this->dispatch->dispatch($created->payNo, $this->clock->now(), $requestId);
+            if ((int) $pay['status'] === TradeConstant::ORDER_STATUS_FAILED) {
+                throw new PaymentDefinitiveException();
+            }
+        }
+        return [
+            'trade_no' => $created->payNo ?? '',
+            'payurl' => (string) url('/cashier/pay', [
+                'biz_no' => $created->bizNo,
+                'token' => $created->accessToken,
+            ])
+                ->suffix(false)
+                ->domain(true)
+                ->root(''),
+            'reused' => $created->reused,
+        ];
+    }
+
+    /**
+     * 查询使用应用当前 PID/KEY；停用后拒绝新 API 请求，原订单通知和收银台责任仍保留。
+     *
+     * @param array<string|int,string> $raw
+     * @return array<string, int|string|array> 易支付自己的结构；金额为元字符串，绝不返回余额托管假数据。
+     */
+    public function api(array $raw): array
+    {
+        $identity = $this->authenticate($raw, false);
+        $app = $identity['app'];
+        $action = $raw['act'] ?? 'query';
+        $this->limiter->check($action === 'refund' ? 'epay_refund' : 'epay_query', $app['id']);
+        if ($action === 'settle') {
+            return ['code' => 1, 'msg' => '本系统自收，无平台结算记录', 'data' => []];
+        }
+        if ($action === 'refund') {
+            $selector = $this->validator->queryIdentity($raw);
+            $input = $this->validator->refund($raw);
+            if ($selector['trade_no'] !== null) {
+                $payNo = $selector['trade_no'];
+            } else {
+                $biz = $this->bizOrders->findByAppOrder($app['id'], $selector['out_trade_no']);
+                $payNo = $biz['active_pay_no'] ?? null;
+                if ($payNo === null) {
+                    throw new BusinessException('支付订单不存在', ApiResponseConstant::NOT_FOUND);
+                }
+            }
+            // 退款内部核对应用归属、成功事实和剩余额度；是否支持退款由原订单插件决定。
+            $refund = $this->refunds->refund(
+                $app['id'],
+                $payNo,
+                $input['amount'],
+                $input['request_no'],
+            );
+            $status = (int) $refund['status'];
+            return [
+                // V1 退款以 0 表示成功；协议码不改变内部退款状态，处理中/未知也不能报成功。
+                'code' => $status === RefundConstant::SUCCESS ? 0 : -1,
+                'msg' =>
+                    $refund['result_code'] === PaymentResultCode::REFUND_UNSUPPORTED
+                        ? '此订单的插件不支持接口退款，请联系收款方处理'
+                        : RefundConstant::label($status),
+                'refund_no' => $refund['refund_no'],
+                'trade_no' => $payNo,
+                'money' => Money::format((int) $refund['refund_amount']),
+                'refund_status' => $status,
+            ];
+        }
+        if (!in_array($action, ['order', 'orders', 'query'], true)) {
+            throw new BusinessException('不支持的易支付操作', ApiResponseConstant::BAD_REQUEST);
+        }
+        return $this->transaction(function () use ($raw, $app, $action): array {
+            if ($action === 'order') {
+                $selector = $this->validator->queryIdentity($raw);
+                if ($selector['trade_no'] !== null) {
+                    $pay = $this->payOrders->find($selector['trade_no']);
+                    $biz = $pay === null ? null : $this->bizOrders->find($pay['biz_no']);
+                } else {
+                    $biz = $this->bizOrders->findByAppOrder($app['id'], $selector['out_trade_no']);
+                }
+                if ($biz === null || $biz['app_id'] !== $app['id']) {
+                    throw new BusinessException('订单不存在', ApiResponseConstant::NOT_FOUND);
+                }
+                // 按支付号已读取原单；只在商户订单号入口补读，消息映射仍核验双单关联。
+                if ($selector['trade_no'] === null) {
+                    $pay = $this->payFor($biz);
+                }
+                return ['code' => 1, 'msg' => '查询成功'] +
+                    $this->messages->order($biz, $pay, $biz['pid']);
+            }
+            if ($action === 'orders') {
+                $page = $this->validator->pagination($raw);
+                $orders = $this->bizOrders->pageForApp($app['id'], $page['page'], $page['limit']);
+                $payments = $this->payOrders->forBizOrders(
+                    array_map(static fn(BizOrder $biz): string => $biz['biz_no'], $orders),
+                );
+                $items = [];
+                foreach ($orders as $biz) {
+                    $pay = $payments[$biz['biz_no']] ?? null;
+                    $items[] = $this->messages->order($biz, $pay, $biz['pid']);
+                }
+                return ['code' => 1, 'msg' => '查询成功', 'data' => $items];
+            }
+            $today = $this->clock->now()->setTime(0, 0);
+            return [
+                'code' => 1,
+                'msg' => '本系统不托管资金，余额固定为 0.00',
+                'pid' => $app['pid'],
+                'active' => (int) $app['status'],
+                'money' => '0.00',
+                'orders' => $this->bizOrders->countForApp($app['id']),
+                'order_today' => $this->bizOrders->countForApp(
+                    $app['id'],
+                    $today->format('Y-m-d H:i:s'),
+                    $today->modify('+1 day')->format('Y-m-d H:i:s'),
+                ),
+                'order_lastday' => $this->bizOrders->countForApp(
+                    $app['id'],
+                    $today->modify('-1 day')->format('Y-m-d H:i:s'),
+                    $today->format('Y-m-d H:i:s'),
+                ),
+            ];
+        });
+    }
+
+    /**
+     * 只对持有访问凭证、已收款且商户已确认的订单生成签名回跳；此调用不修改任何支付状态。
+     * return_url 的 query 可能与 notify_url 不同，必须用原版本 KEY 独立合并签名。
+     */
+    public function returnUrl(string $bizNo, string $accessToken): string
+    {
+        return $this->transaction(function () use ($bizNo, $accessToken): string {
+            $biz = $this->bizOrders->find($bizNo);
+            $this->orders->assertAccess($biz, $accessToken);
+            $this->limiter->check('cashier_read', $bizNo);
+            $pay = $this->payFor($biz);
+            if ($pay === null || (int) $biz['status'] !== TradeConstant::ORDER_STATUS_SUCCESS) {
+                throw new BusinessException('订单尚未确认支付成功', ApiResponseConstant::CONFLICT);
+            }
+            if ($biz['return_url'] === null) {
+                throw new BusinessException(
+                    '此订单未设置回跳地址，请留在结果页',
+                    ApiResponseConstant::CONFLICT,
+                );
+            }
+            // 同一一致性事务内核对首次 ACK 并签名，不调用收银台响应入口重复读取订单。
+            if ($biz['notify_url'] === null) {
+                throw new RuntimeException('订单返回地址缺少通知责任');
+            }
+            if ($this->cashier->notificationStatus($bizNo, $pay['pay_no']) !== 'success') {
+                throw new BusinessException('订单尚未完成商户确认', ApiResponseConstant::CONFLICT);
+            }
+            // 使用原单冻结目标，格式由签名/编码方法核验；浏览器回跳不执行服务器出站检查。
+            $parameters = $this->messages->signForTarget(
+                $biz['return_url'],
+                $this->messages->successParameters($biz, $pay, $biz['pid']),
+                $this->credentials->secretForVersion($biz['app_id'], $biz['credential_version_id']),
+            );
+            return $this->messages->targetUrl($biz['return_url'], $parameters);
+        });
+    }
+
+    /**
+     * 不把 KEY 放入返回结构或认证失败消息；新建单会在应用锁下再次核对 PID 和活动密钥版本。
+     *
+     * @param array<string|int,string> $raw
+     * @return array{app:PaymentApp,version:string}
+     */
+    private function authenticate(array $raw, bool $signed): array
+    {
+        $pid = $this->validator->pid($raw);
+        // 签名格式和匹配统一交给 signer；KEY 认证入口只检查自身的凭证边界。
+        if (!$signed && (($raw['key'] ?? '') === '' || strlen($raw['key']) > 512)) {
+            throw new BusinessException(
+                'PID、KEY 或签名无效',
+                ApiResponseConstant::UNAUTHENTICATED,
+            );
+        }
+        return $this->transaction(function () use ($pid, $raw, $signed): array {
+            $app = $this->apps->findByPid($pid);
+            if ($app === null || (int) $app['status'] !== 1) {
+                throw new BusinessException(
+                    'PID、KEY 或签名无效',
+                    ApiResponseConstant::UNAUTHENTICATED,
+                );
+            }
+            $version = $this->credentials->active($app);
+            $valid =
+                $version !== null &&
+                ($signed
+                    ? $this->signer->verify($raw, $version['secret'])
+                    : hash_equals($version['key_fingerprint'], hash('sha256', $raw['key'])));
+            if (!$valid) {
+                throw new BusinessException(
+                    'PID、KEY 或签名无效',
+                    ApiResponseConstant::UNAUTHENTICATED,
+                );
+            }
+            $matched = $version['id'];
+            return ['app' => $app, 'version' => $matched];
+        });
+    }
+
+    /** 已在只读事务中加载的业务单对应的唯一支付尝试；缺失关联不能当成普通未支付。 */
+    private function payFor(BizOrder $biz): ?PayOrder
+    {
+        if ($biz['active_pay_no'] === null) {
+            if (
+                (int) $biz['attempt_count'] !== 0 ||
+                (int) $biz['status'] === TradeConstant::ORDER_STATUS_SUCCESS
+            ) {
+                throw new RuntimeException('业务单的支付关联缺失');
+            }
+            return null;
+        }
+        return $this->payOrders->find($biz['active_pay_no']) ??
+            throw new RuntimeException('业务单引用的支付单缺失');
+    }
+}

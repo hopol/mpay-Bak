@@ -1,0 +1,166 @@
+<?php
+declare(strict_types=1);
+
+namespace app\service\payment\plugin;
+
+use app\common\constant\ApiResponseConstant;
+use app\common\interface\PaymentInterface;
+use app\common\interface\ReceiptCollectorInterface;
+use app\exception\BusinessException;
+use app\repository\payment\config\PaymentPluginRepository;
+use LogicException;
+use ReflectionClass;
+use think\App;
+use think\Config;
+
+/** 全量发现用于目录同步；单项按已同步映射核对固定文件，每次执行创建独立实例。 */
+final class PaymentPluginFactoryService
+{
+    /** @var array<string,class-string<PaymentInterface>>|null 当前请求发现的安装代码；常驻进程部署更新后应重启。 */
+    private ?array $installed = null;
+
+    /** @var array<class-string<PaymentInterface>,PluginDefinition> 代码定义只核验一次；不缓存带通道配置的执行实例。 */
+    private array $definitions = [];
+
+    public function __construct(
+        private readonly App $app,
+        private readonly Config $config,
+        private readonly PaymentPluginRepository $records,
+    ) {}
+
+    /** @return list<string> 只列随本程序交付的插件，不从数据库或请求加载类名。 */
+    public function codes(): array
+    {
+        return array_keys($this->registrations());
+    }
+
+    public function make(string $code): PaymentInterface
+    {
+        return $this->app->make($this->definition($code)->className, [], true);
+    }
+
+    /** 单项核对本地代码与同步编码；元信息按类复用，不缓存通道配置或执行实例。 */
+    public function definition(string $code): PluginDefinition
+    {
+        // 已全量发现的入口复用注册结果；普通单项读取不触发目录扫描。
+        $class = $this->installed[$code] ?? null;
+        if ($class === null && $this->isolated()) {
+            $class = $this->registrations()[$code] ?? null;
+        }
+        if ($class === null) {
+            $row = $this->records->find($code);
+            if ($row === null || !$this->hasClass($row['class_name'])) {
+                throw new BusinessException('插件未安装，请刷新插件目录', ApiResponseConstant::SERVICE_UNAVAILABLE);
+            }
+            $class = $row['class_name'];
+        }
+        $definition = $this->definitions[$class] ?? $this->describe($this->app->make($class, [], true));
+        if ($definition->code !== $code) {
+            throw new BusinessException('插件编码与同步目录不一致，请刷新插件目录', ApiResponseConstant::CONFLICT);
+        }
+        return $definition;
+    }
+
+    /** 数据库映射只能指向固定目录的具体支付插件，不能作为任意类名或文件加载入口。 */
+    public function hasClass(string $class): bool
+    {
+        // 沿用显式隔离注册；此分支受同一组 CLI/常量/环境条件约束。
+        if ($this->isolated()) {
+            return in_array($class, $this->registrations(), true);
+        }
+        $prefix = 'app\\common\\payment\\';
+        if (!str_starts_with($class, $prefix)) {
+            return false;
+        }
+        $name = substr($class, strlen($prefix));
+        return preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/D', $name) === 1 &&
+            is_file($this->app->getAppPath() . 'common/payment/' . $name . '.php') &&
+            is_a($class, PaymentInterface::class, true) &&
+            (new ReflectionClass($class))->isInstantiable();
+    }
+
+    public function describe(PaymentInterface $plugin): PluginDefinition
+    {
+        if (isset($this->definitions[$plugin::class])) {
+            return $this->definitions[$plugin::class];
+        }
+        // 发现/刷新时即核对采集声明，避免错误类型等到后台任务执行才暴露。
+        if ($plugin instanceof ReceiptCollectorInterface) {
+            $plugin->isPreloginEnabled();
+        }
+        return $this->definitions[$plugin::class] = new PluginDefinition(
+            $plugin->getCode(),
+            $plugin->getVersion(),
+            $plugin->getName(),
+            $plugin->getEnabledPayTypes(),
+            $plugin->getConfigSchema(),
+            $plugin::class,
+            $plugin->getDescription(),
+        );
+    }
+
+    /** 配置值在保存入口校验；执行时只为当前动作创建独立实例并注入原配置。 */
+    public function initialize(string $code, array $settings): PaymentInterface
+    {
+        $plugin = $this->make($code);
+        $plugin->init($settings);
+        return $plugin;
+    }
+
+    /** @return array<string,class-string<PaymentInterface>> 固定目录的完整发现结果；测试扩展仅在显式隔离入口生效。 */
+    private function registrations(): array
+    {
+        if ($this->installed !== null) {
+            return $this->installed;
+        }
+        $plugins = [];
+        // 只扫描交付代码目录的主类，不递归 SDK，也不执行数据库/请求提供的任意文件名。
+        foreach (glob($this->app->getAppPath() . 'common/payment/*.php') ?: [] as $file) {
+            $class = 'app\\common\\payment\\' . pathinfo($file, PATHINFO_FILENAME);
+            if (
+                !is_a($class, PaymentInterface::class, true) ||
+                !(new ReflectionClass($class))->isInstantiable()
+            ) {
+                continue;
+            }
+            $definition = $this->describe($this->app->make($class, [], true));
+            if (isset($plugins[$definition->code])) {
+                throw new LogicException('插件编码重复');
+            }
+            $plugins[$definition->code] = $class;
+        }
+        $tests = $this->isolated() ? $this->config->get('payment.test_plugins', []) : [];
+        if (!is_array($tests) || array_intersect_key($plugins, $tests)) {
+            throw new LogicException('插件注册表格式或隔离边界无效');
+        }
+        // 隔离入口的显式注册也在发现阶段核验，不能绕过正式实例的接口和编码合同。
+        foreach ($tests as $code => $class) {
+            if (
+                !is_string($class) ||
+                !is_a($class, PaymentInterface::class, true) ||
+                !(new ReflectionClass($class))->isInstantiable()
+            ) {
+                throw new LogicException('插件必须实现元信息与支付动作接口');
+            }
+            $definition = $this->describe($this->app->make($class, [], true));
+            if ($definition->code !== $code) {
+                throw new LogicException('插件编码与注册表不一致');
+            }
+            $plugins[$code] = $class;
+        }
+        ksort($plugins);
+        return $this->installed = $plugins;
+    }
+
+    /** 既有隔离注册仅供显式测试入口；正式单项读取不能由环境变量切换为全量发现。 */
+    private function isolated(): bool
+    {
+        return (PHP_SAPI === 'cli' ||
+                (PHP_SAPI === 'cli-server' &&
+                    defined('MPAY_ISOLATED_HTTP') &&
+                    MPAY_ISOLATED_HTTP === true)) &&
+            defined('MPAY_ISOLATED_TEST') &&
+            MPAY_ISOLATED_TEST === true &&
+            $this->config->get('mpay.environment') === 'testing';
+    }
+}
