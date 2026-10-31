@@ -12,6 +12,7 @@ use app\repository\payment\config\PaymentChannelRepository;
 use app\repository\payment\config\PaymentPollGroupRepository;
 use app\service\system\audit\ConfigurationActionContext;
 use app\service\system\audit\ConfigurationAuditService;
+use RuntimeException;
 
 /** 组、成员与应用绑定的管理用例；保持版本竞争检查，预览复用选路且不推进游标。 */
 final class PaymentPollGroupService extends BaseService
@@ -29,10 +30,15 @@ final class PaymentPollGroupService extends BaseService
     public function listing(): array
     {
         return $this->transaction(function (): array {
+            $groups = $this->groups->all();
+            $groupMembers = $this->groups->membersForGroups(
+                array_map(static fn($group): string => $group['id'], $groups),
+            );
+            $defaultGroupIds = $this->catalog->defaultGroupIds();
             $items = [];
-            foreach ($this->groups->all() as $group) {
+            foreach ($groups as $group) {
                 $members = [];
-                foreach ($this->groups->members($group['id']) as $member) {
+                foreach ($groupMembers[$group['id']] ?? [] as $member) {
                     $members[] = [
                         'channel_id' => $member['channel_id'],
                         'sort_no' => (int) $member['sort_no'],
@@ -45,7 +51,7 @@ final class PaymentPollGroupService extends BaseService
                     'id' => $group['id'],
                     'name' => $group['name'],
                     'pay_type_id' => $group['pay_type_id'],
-                    'is_default' => in_array($group['id'], $this->catalog->defaultGroupIds(), true),
+                    'is_default' => in_array($group['id'], $defaultGroupIds, true),
                     'route_mode' => $group['route_mode'],
                     'enabled' => (int) $group['status'] === 1,
                     'revision' => (int) $group['revision'],
@@ -172,14 +178,7 @@ final class PaymentPollGroupService extends BaseService
                 throw new \RuntimeException('轮询组支付方式缺失');
             $this->assertMembers($members, $type);
             $this->groups->replaceMembers($id, $members);
-            $this->groups->update(
-                $group,
-                $name,
-                $mode,
-                $enabled,
-                $remark,
-                date('Y-m-d H:i:s'),
-            );
+            $this->groups->update($group, $name, $mode, $enabled, $remark, date('Y-m-d H:i:s'));
             $this->audit->record($actor, 'poll_group.save', 'payment_poll_group', $id, 'updated', [
                 'enabled' => $enabled,
             ]);
@@ -227,20 +226,10 @@ final class PaymentPollGroupService extends BaseService
             }
             // 相关锁和校验完成后取记录时间，绑定与默认模式变更共用同一读数。
             $now = date('Y-m-d H:i:s');
-            $this->groups->bind(
-                $appId,
-                $type['id'],
-                $groupId,
-                $enabled,
-                $now,
-            );
+            $this->groups->bind($appId, $type['id'], $groupId, $enabled, $now);
             // 显式保存某一方式绑定即为自定义意图；CLI 与后台执行同一规则。
             if ((int) $app['use_default_route'] === 1) {
-                $this->apps->setDefaultRoute(
-                    $app,
-                    false,
-                    $now,
-                );
+                $this->apps->setDefaultRoute($app, false, $now);
             }
             $this->audit->record($actor, 'application.bind', 'payment_app', $appId, 'updated', [
                 'enabled' => $enabled,
@@ -252,7 +241,7 @@ final class PaymentPollGroupService extends BaseService
     public function preview(string $appId, string $payType, int $amount): array
     {
         return $this->transaction(function () use ($appId, $payType, $amount): array {
-            $app = $this->apps->lock($appId);
+            $app = $this->apps->find($appId) ?? throw new RuntimeException('应用不存在');
             if ((int) $app['status'] !== 1) {
                 throw new BusinessException('应用已停用', ApiResponseConstant::CONFLICT);
             }

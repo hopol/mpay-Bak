@@ -28,8 +28,8 @@ final class ReceiptFlowRepository extends BaseRepository
 
     /**
      * 本批先查询已有消费，避免成功订单不在待付集合后，旧流水被匹配到另一订单。
-     * 此读取仅供插件排除，最终确认仍由唯一键和锁内复核保证。
-     * @return list<ReceiptFlow>
+     * 本预查仅取身份字段供插件排除，最终确认仍由唯一键和锁内复核保证。
+     * @return list<ReceiptFlow> 仅含 event_key、platform_trade_no、pay_no，不用于交易写入。
      */
     public function consumed(string $plugin, array $events, array $trades): array
     {
@@ -44,39 +44,9 @@ final class ReceiptFlowRepository extends BaseRepository
                     $query->whereOr('platform_trade_no', 'in', $trades);
                 }
             })
+            ->field('event_key,platform_trade_no,pay_no')
             ->select()
             ->all();
-    }
-
-    /**
-     * @param array{from?:string,until?:string,id?:string,scope_key?:string,plugin_code?:string,pay_no?:string} $filters 按系统接收时间筛选，日期缺省时查询全部。
-     * @return array{items:list<ReceiptFlow>,total:int} 服务拥有一致读取事务，不在这里猜测匹配结果。
-     */
-    public function adminPage(array $filters, int $page, int $limit): array
-    {
-        $query = $this->model->where('id', '>', 0);
-        if (isset($filters['from'], $filters['until'])) {
-            $query
-                ->where('received_at', '>=', $filters['from'])
-                ->where('received_at', '<', $filters['until']);
-        }
-        foreach (
-            [
-                'id' => 'id',
-                'scope_key' => 'receipt_scope_key',
-                'plugin_code' => 'plugin_code',
-                'pay_no' => 'pay_no',
-            ]
-            as $key => $column
-        ) {
-            if (isset($filters[$key])) {
-                $query->where($column, $filters[$key]);
-            }
-        }
-        return [
-            'total' => (int) (clone $query)->count(),
-            'items' => $query->order('id', 'desc')->page($page, $limit)->select()->all(),
-        ];
     }
 
     /** 调用前已锁对应 ReceiptScope；生命周期还必须先锁业务单及支付单。 */
@@ -114,7 +84,7 @@ final class ReceiptFlowRepository extends BaseRepository
      *
      * @param array{receipt_scope_key:string,plugin_code:string,
      *     event_key:string,payload_digest:string,platform_trade_no:?string,
-     *     amount:int,remark:?string,paid_at:?string,received_at:string,pay_no:string,
+     *     amount:int,paid_at:string,received_at:string,pay_no:string,
      *     reason_code:?string,evidence_json:string} $data 金额为分，时间为上海时区秒精度。
      */
     public function create(array $data): string
@@ -127,7 +97,6 @@ final class ReceiptFlowRepository extends BaseRepository
             'payload_digest',
             'platform_trade_no',
             'amount',
-            'remark',
             'paid_at',
             'received_at',
             'pay_no',

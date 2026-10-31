@@ -20,14 +20,11 @@ Route::group('admin', function (): void {
     Route::rule('dashboard', [AdminController::class, 'dashboard'], 'GET|HEAD')
         ->name('admin.page.dashboard')
         ->middleware('admin.auth');
-    Route::rule('receipts', [AdminController::class, 'receipts'], 'GET|HEAD')
-        ->name('admin.page.receipts')
+    Route::rule('callbacks', [AdminController::class, 'callbacks'], 'GET|HEAD')
+        ->name('admin.page.callbacks')
         ->middleware('admin.auth');
     Route::rule('notifications', [AdminController::class, 'notifications'], 'GET|HEAD')
         ->name('admin.page.notifications')
-        ->middleware('admin.auth');
-    Route::rule('ingress', [AdminController::class, 'ingress'], 'GET|HEAD')
-        ->name('admin.page.ingress')
         ->middleware('admin.auth');
     Route::rule('audit', [AdminController::class, 'audit'], 'GET|HEAD')
         ->name('admin.page.audit')
@@ -57,11 +54,15 @@ Route::group('admin', function (): void {
     ->middleware('rate', ['rule' => 'admin_ip'])
     ->middleware('session');
 Route::group('cashier', function (): void {
-    Route::rule('success', [CashierController::class, 'completed'], 'GET|HEAD')->name(
-        'cashier.success',
-    );
-    Route::rule('pay', [CashierController::class, 'index'], 'GET|HEAD')
+    Route::rule(
+        'success/:biz_no/:token',
+        [CashierController::class, 'completed'],
+        'GET|HEAD',
+    )->name('cashier.success');
+    Route::rule('pay/:biz_no/:token', [CashierController::class, 'index'], 'GET|HEAD')
         ->name('cashier.pay')
         ->middleware('session');
-    Route::rule('return', [CashierController::class, 'back'], 'GET|HEAD')->name('cashier.return');
+    Route::rule('return/:biz_no/:token', [CashierController::class, 'back'], 'GET|HEAD')->name(
+        'cashier.return',
+    );
 })->middleware('rate', ['rule' => 'cashier_ip']);

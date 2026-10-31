@@ -197,21 +197,16 @@ final class PaymentChannelEditorService extends BaseService
     /** 从当前配置已登记的支付方式关联取得业务锁范围。 */
     private function scopeForType(string $id, string $type): string
     {
-        $keys = [];
-        foreach ($this->scopes->configurationScopes($id, false) as $scope) {
-            $key = $scope['receipt_scope_key'];
-            if ($this->catalog->typeCode($scope['pay_type_id']) === $type) {
-                $keys[] = $key;
-            }
-        }
-        if (count($keys) !== 1) {
+        $payType = $this->catalog->findCode($type);
+        $scope = $payType === null ? null : $this->scopes->forConfiguration($id, $payType['id']);
+        if ($scope === null) {
             throw new BusinessException('插件配置缺少唯一的支付方式关联', Code::CONFLICT);
         }
-        return $keys[0];
+        return $scope['receipt_scope_key'];
     }
 
     /**
-     * 插件参数独立保存；仅当前通道生成新快照并停用，已有订单继续引用原快照。
+     * 插件参数独立保存；当前通道生成新快照并保持启停状态，已有订单继续引用原快照。
      * 不通过额外调用“编辑通道”来完成配置更新，版本检查及快照刷新在同一事务中结束。
      * @param array<string,mixed> $input plugin-save 场景，配置正文不得记录到日志。
      */
@@ -227,7 +222,6 @@ final class PaymentChannelEditorService extends BaseService
                 array_unique([...$observed['pay_types'], ...$definition->payTypes]),
             );
             $configuration = $this->configurations->lock($observed['api_config_id']);
-            $this->channels->lockForConfiguration($configuration['id']);
             $channel = $this->channels->lock($input['id']);
             $this->assertCurrent($configuration, $channel, $input);
             $saved = $this->configurationService->saveInTransaction(
@@ -238,7 +232,7 @@ final class PaymentChannelEditorService extends BaseService
             );
             if ($saved['config_version'] !== $input['expected_configuration_version']) {
                 $updated = $this->configurations->lock($configuration['id']);
-                $this->revisions->freezeLocked($updated, $this->channels->lock($channel['id']));
+                $this->revisions->freezeLocked($updated, $channel);
             }
             return $saved;
         });
@@ -303,10 +297,7 @@ final class PaymentChannelEditorService extends BaseService
                 );
             }
             $this->defaults->removeChannel($channel['id']);
-            $this->channels->markDeleted(
-                $channel['id'],
-                date('Y-m-d H:i:s'),
-            );
+            $this->channels->markDeleted($channel['id'], date('Y-m-d H:i:s'));
             $this->audit->record(
                 $actor,
                 'channel.delete',

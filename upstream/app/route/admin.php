@@ -202,20 +202,12 @@ Route::group('adminapi', function (): void {
                 ])->name('admin.configuration.channel-delete');
             })->middleware('admin.configuration.write');
         });
-        Route::group('receipts', function (): void {
-            Route::rule('list', [OperationsController::class, 'receipts'], 'GET|HEAD')->name(
-                'admin.receipts.list',
+        Route::group('callbacks', function (): void {
+            Route::rule('list', [OperationsController::class, 'callbacks'], 'GET|HEAD')->name(
+                'admin.callbacks.list',
             );
-            Route::rule('detail', [OperationsController::class, 'receipt'], 'GET|HEAD')->name(
-                'admin.receipts.detail',
-            );
-            Route::rule(
-                'history',
-                [OperationsController::class, 'receiptHistory'],
-                'GET|HEAD',
-            )->name('admin.receipts.history');
-            Route::rule('ingress', [OperationsController::class, 'ingress'], 'GET|HEAD')->name(
-                'admin.receipts.ingress',
+            Route::rule('detail', [OperationsController::class, 'callback'], 'GET|HEAD')->name(
+                'admin.callbacks.detail',
             );
         });
         Route::group('notifications', function (): void {
@@ -258,6 +250,14 @@ Route::group('adminapi', function (): void {
                 ->middleware('admin.write');
             Route::post('close', [PayOrderController::class, 'close'])
                 ->name('admin.orders.close')
+                ->middleware('admin.write');
+            Route::post('refund', [PayOrderController::class, 'refund'])
+                ->name('admin.orders.refund')
+                ->middleware('rate', [
+                    'rule' => 'admin_sensitive',
+                    'identity' => 'admin',
+                    'action' => 'refund',
+                ])
                 ->middleware('admin.write');
             Route::post('retry-notification', [PayOrderController::class, 'retryNotification'])
                 ->name('admin.orders.retry')

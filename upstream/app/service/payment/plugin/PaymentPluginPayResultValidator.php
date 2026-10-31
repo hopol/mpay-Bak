@@ -12,16 +12,24 @@ use UnexpectedValueException;
 final class PaymentPluginPayResultValidator extends Validate
 {
     protected $rule = [
-        'status' => ['require', 'string', 'in' => ['pending', 'success']],
+        'status' => ['require', 'string', 'in' => ['pending']],
         'pay_no' => ['require', 'string', 'max' => 64],
         'paid_amount' => ['requirePaidAmount'],
         'chan_order_no' => ['requireReference'],
         'chan_trade_no' => ['requireReference'],
     ];
 
+    public function __construct(private readonly PaymentPluginNotifyResultValidator $notifications)
+    {
+        parent::__construct();
+    }
+
     /** @return array<string,mixed> 保留经过检查的标准字段，平台额外原文不会进入订单快照。 */
     public function validateResult(array $result): array
     {
+        if (($result['status'] ?? null) === 'success') {
+            return $this->notifications->validateResult($result);
+        }
         // 只用真实交易号补缺失的渠道订单号；已有订单号不覆盖，也不反向补交易号。
         if (($result['chan_order_no'] ?? '') === '') {
             $result['chan_order_no'] = $result['chan_trade_no'] ?? null;
@@ -29,22 +37,17 @@ final class PaymentPluginPayResultValidator extends Validate
         if (!(clone $this)->failException(false)->check($result)) {
             throw new UnexpectedValueException('插件下单结果不符合标准字段');
         }
-        if ($result['status'] === 'pending') {
-            $view = $result['presentation'] ?? null;
-            if (
-                !is_array($view) ||
-                array_diff(array_keys($view), ['pay_page', 'pay_params']) !== []
-            ) {
-                throw new UnexpectedValueException('插件支付展示结构无效');
-            }
-            $result['presentation'] = self::presentation(
-                $view + [
-                    'pay_type' => $result['pay_type'] ?? null,
-                    'pay_product' => $result['pay_product'] ?? null,
-                    'pay_action' => $result['pay_action'] ?? null,
-                ],
-            );
+        $view = $result['presentation'] ?? null;
+        if (!is_array($view) || array_diff(array_keys($view), ['pay_page', 'pay_params']) !== []) {
+            throw new UnexpectedValueException('插件支付展示结构无效');
         }
+        $result['presentation'] = self::presentation(
+            $view + [
+                'pay_type' => $result['pay_type'] ?? null,
+                'pay_product' => $result['pay_product'] ?? null,
+                'pay_action' => $result['pay_action'] ?? null,
+            ],
+        );
         return array_intersect_key(
             $result,
             array_flip([
@@ -57,8 +60,6 @@ final class PaymentPluginPayResultValidator extends Validate
                 'pay_product',
                 'pay_action',
                 'presentation',
-                'receipt',
-                'paid_at',
             ]),
         );
     }
@@ -115,15 +116,10 @@ final class PaymentPluginPayResultValidator extends Validate
         return $view;
     }
 
-    /** 字段必须存在；待付款为 null，成功时才允许正整数分，不根据展示材料猜金额。 */
+    /** pending 金额字段必须存在且为 null；成功结果在入口交由通知验证器完整核验。 */
     protected function requirePaidAmount(mixed $value, mixed $rule, array $data): bool
     {
-        return array_key_exists('paid_amount', $data) &&
-            match ($data['status'] ?? null) {
-                'pending' => $value === null,
-                'success' => is_int($value) && $value > 0,
-                default => false,
-            };
+        return array_key_exists('paid_amount', $data) && $value === null;
     }
 
     /** require 前缀检查字段存在；订单号已按合同补缺，交易号须显式提供，无真实编号时为 null。 */

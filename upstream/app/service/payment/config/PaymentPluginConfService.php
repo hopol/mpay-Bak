@@ -9,7 +9,6 @@ use app\common\validation\PluginConfigValidator;
 use app\exception\BusinessException;
 use app\model\payment\PaymentPluginConf;
 use app\repository\payment\config\PaymentCatalogRepository;
-use app\repository\payment\config\PaymentChannelRepository;
 use app\repository\payment\config\PaymentPluginConfRepository;
 use app\repository\payment\receipt\ReceiptScopeRepository;
 use app\service\file\FileAssetService;
@@ -30,7 +29,6 @@ final class PaymentPluginConfService extends BaseService
 {
     public function __construct(
         private readonly PaymentPluginConfRepository $configurations,
-        private readonly PaymentChannelRepository $channels,
         private readonly ReceiptScopeRepository $scopes,
         private readonly PaymentCatalogRepository $catalog,
         private readonly PaymentPluginFactoryService $plugins,
@@ -96,7 +94,7 @@ final class PaymentPluginConfService extends BaseService
     /**
      * Editor 已在外层事务鉴权、锁定配置及关联通道并核对版本；复用该模型保存完整参数。
      * 调用方先锁插件支持的全部方式及默认组，禁止在此补取新的方式锁；本方法继续核验参数、材料及范围。
-     * 参数或插件版本改变时创建新快照并停用当前通道；存量快照不改写。
+     * 参数或插件版本改变时创建新快照，保持原启停状态；存量快照不改写。
      * @param array<string,mixed> $settings
      * @return array{id:string,config_version:int,enabled:bool}
      */
@@ -146,7 +144,6 @@ final class PaymentPluginConfService extends BaseService
             $definition->version,
             $now,
         );
-        $this->channels->disableForConfiguration($id, $now);
         // 参数修改不改变配置 ID 与支付方式，通道范围沿用原关联；接入切换由 Editor 保存通道规则。
         $this->audit->record($actor, 'configuration.save', 'payment_plugin_conf', $id, 'updated', [
             'old_version' => $currentVersion,
@@ -203,11 +200,15 @@ final class PaymentPluginConfService extends BaseService
         }
     }
 
-    /** 图片只允许引用已登记资产；字段名称和是否存在由插件 schema 决定。 */
+    /** 当前条件下使用的上传项须引用已登记资产；隐藏项保留配置值，不读取文件。 */
     private function validateAssets(PluginDefinition $definition, array $settings): void
     {
         foreach ($definition->configSchema as $field) {
-            if ($field['type'] === 'upload' && ($settings[$field['field']] ?? '') !== '') {
+            if (
+                $field['type'] === 'upload' &&
+                PluginConfigValidator::isVisible($field, $settings) &&
+                ($settings[$field['field']] ?? '') !== ''
+            ) {
                 $this->files->publicImagePath($settings[$field['field']]);
             }
         }

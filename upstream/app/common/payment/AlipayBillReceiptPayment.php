@@ -59,6 +59,14 @@ final class AlipayBillReceiptPayment extends BasePayment implements ReceiptColle
             ],
             [
                 'type' => 'number',
+                'field' => 'receipt_watcher_query_interval_seconds',
+                'title' => '账号查询间隔（秒）',
+                'validate' => [0 => 'require', 'between' => [2, 300]],
+                'value' => 3,
+                'help' => '同账号正常查询结束后的等待时间；失败仍按插件退避，不影响付款有效期。',
+            ],
+            [
+                'type' => 'number',
                 'field' => 'amount_offset_max',
                 'title' => '金额偏移上限（分）',
                 'validate' => [0 => 'require', 'between' => [0, 99]],
@@ -102,7 +110,7 @@ final class AlipayBillReceiptPayment extends BasePayment implements ReceiptColle
                 'type' => 'input',
                 'field' => 'bill_user_id',
                 'title' => '账单用户 ID',
-                'validate' => [0 => 'require', 1 => 'string', 'length' => [16, 32]],
+                'validate' => [0 => 'require', 1 => 'string', 'regex' => '/^[0-9]{16,32}$/D'],
             ],
             [
                 'type' => 'textarea',
@@ -149,16 +157,15 @@ final class AlipayBillReceiptPayment extends BasePayment implements ReceiptColle
         $prepared = $this->prepareReceipt($order['pay_no'], $order['channel_id']);
         $meta = $this->receiptMeta($prepared['ext_json']);
         $transfer = $this->getConfig('receipt_match_mode') === 'alipay_transfer';
-        $params =
-            $transfer
-                ? $this->transferParams($meta['receipt_amount'], $meta['remark'])
-                : [
-                    '_page' => 'receiptQrcode',
-                    'qrcode_content' => $this->getConfig('receipt_qrcode_content') ?: null,
-                    'qrcode_image_url' => $order['assets']['receipt_qrcode_image'] ?? null,
-                    'instruction' => $meta['match_mode'] === 'remark' ? 'manual_remark' : 'scan',
-                    'remark' => $meta['remark'],
-                ];
+        $params = $transfer
+            ? $this->transferParams($meta['receipt_amount'], $meta['remark'])
+            : [
+                '_page' => 'receiptQrcode',
+                'qrcode_content' => $this->getConfig('receipt_qrcode_content') ?: null,
+                'qrcode_image_url' => $order['assets']['receipt_qrcode_image'] ?? null,
+                'instruction' => $meta['match_mode'] === 'remark' ? 'manual_remark' : 'scan',
+                'remark' => $meta['remark'],
+            ];
         return [
             'status' => 'pending',
             'pay_no' => $order['pay_no'],
@@ -174,47 +181,14 @@ final class AlipayBillReceiptPayment extends BasePayment implements ReceiptColle
     }
 
     /**
-     * 沿用 V2 支付宝客户端入口格式，分别生成扫码与手机链接；平台规则留在本插件。
+     * 沿用 V2 支付宝扫码入口格式；平台规则留在本插件，页面统一展示二维码。
      * 参数只包含本单已准备的公开付款事实，不向页面传递账单 API 凭证。
-     * @return array{_page:string,qrcode_content:string,transfer_url:string}
+     * @return array{_page:string,qrcode_content:string}
      */
     private function transferParams(int $cents, string $remark): array
     {
         $user = (string) $this->getConfig('bill_user_id');
-        if (!preg_match('/^[0-9]{16,32}$/D', $user)) {
-            throw new BusinessException(
-                '自动备注付款需要有效的支付宝用户 ID',
-                ApiResponseConstant::VALIDATION_FAILED,
-            );
-        }
         $amount = Money::format($cents);
-        $scheme =
-            'alipays://platformapi/startapp?' .
-            http_build_query(
-                [
-                    'appId' => '20000116',
-                    'actionType' => 'toAccount',
-                    'goBack' => 'NO',
-                    'amount' => $amount,
-                    'userId' => $user,
-                    'memo' => $remark,
-                ],
-                '',
-                '&',
-                PHP_QUERY_RFC3986,
-            );
-        $render =
-            'https://render.alipay.com/p/s/i?' .
-            http_build_query(['scheme' => $scheme], '', '&', PHP_QUERY_RFC3986);
-        $middle =
-            'alipays://platformapi/startapp?' .
-            http_build_query(['appId' => '20000218', 'url' => $render], '', '&', PHP_QUERY_RFC3986);
-        $target =
-            'https://render.alipay.com/p/s/i?' .
-            http_build_query(['scheme' => $middle], '', '&', PHP_QUERY_RFC3986);
-        $mobile =
-            'https://render.alipay.com/p/c/mdeduct-landing?' .
-            http_build_query(['scheme' => $target], '', '&', PHP_QUERY_RFC3986);
         $qr =
             'alipays://platformapi/startapp?' .
             http_build_query(
@@ -230,7 +204,7 @@ final class AlipayBillReceiptPayment extends BasePayment implements ReceiptColle
                 '&',
                 PHP_QUERY_RFC3986,
             );
-        return ['_page' => 'alipayTransfer', 'qrcode_content' => $qr, 'transfer_url' => $mobile];
+        return ['_page' => 'alipayTransfer', 'qrcode_content' => $qr];
     }
 
     /**
@@ -245,10 +219,7 @@ final class AlipayBillReceiptPayment extends BasePayment implements ReceiptColle
             $pay = $this->orders->lock($payNo);
             // 同一通道跨应用、跨配置版本使用同一行锁；不反向锁其他订单。
             $this->channels->lock($pay['channel_id']);
-            if (
-                $pay['channel_id'] !== $channelId ||
-                $pay['biz_no'] !== $biz['biz_no']
-            ) {
+            if ($pay['channel_id'] !== $channelId || $pay['biz_no'] !== $biz['biz_no']) {
                 throw new LogicException('插件与支付单通道不一致');
             }
             $ext = $pay['ext_json'] ?? [];
@@ -429,7 +400,10 @@ final class AlipayBillReceiptPayment extends BasePayment implements ReceiptColle
             $seen[$record['event_key']] = true;
             $byChannel = [];
             foreach ($orders as $pay) {
-                if (($pay['ext_json']['payment_context']['pay_type'] ?? null) !== $record['pay_type']) {
+                if (
+                    ($pay['ext_json']['payment_context']['pay_type'] ?? null) !==
+                    $record['pay_type']
+                ) {
                     continue;
                 }
                 if (!array_key_exists($pay['pay_no'], $prepared)) {
@@ -470,25 +444,32 @@ final class AlipayBillReceiptPayment extends BasePayment implements ReceiptColle
                 continue;
             }
             $paid = strtotime($record['paid_at']);
-            usort(
-                $candidates,
-                static fn(array $a, array $b): int => abs(
-                    $prepared[$a['pay_no']]['requested_at'] - $paid,
-                ) <=> abs($prepared[$b['pay_no']]['requested_at'] - $paid) ?:
-                strcmp($a['created_at'], $b['created_at']) ?:
-                strlen($a['id']) <=> strlen($b['id']) ?:
-                strcmp($a['id'], $b['id']),
-            );
             $pay = $candidates[0];
+            // 只需最优候选，不对整组排序；同距时仍按创建时间和完整 ID 决定。
+            foreach ($candidates as $candidate) {
+                $comparison =
+                    abs($prepared[$candidate['pay_no']]['requested_at'] - $paid) <=>
+                    abs($prepared[$pay['pay_no']]['requested_at'] - $paid) ?:
+                    strcmp($candidate['created_at'], $pay['created_at']) ?:
+                    strlen($candidate['id']) <=> strlen($pay['id']) ?:
+                    strcmp($candidate['id'], $pay['id']);
+                if ($comparison < 0) {
+                    $pay = $candidate;
+                }
+            }
             $meta = $prepared[$pay['pay_no']]['meta'];
             $used[$pay['pay_no']] = true;
             $results[] = [
                 'status' => 'success',
                 'pay_no' => $pay['pay_no'],
                 'paid_amount' => $meta['original_amount'],
-                'chan_order_no' => $record['trade_no'],
+                'chan_order_no' => $record['trade_no'] ?? $record['event_key'],
                 'chan_trade_no' => $record['trade_no'],
-                'receipt' => $record,
+                'pay_type' => $record['pay_type'],
+                'received_amount' => $record['amount'],
+                'paid_at' => $record['paid_at'] ?? $context['received_at'],
+                'event_key' => $record['event_key'],
+                'raw' => $record['raw'],
             ];
         }
         return $results;
@@ -652,7 +633,10 @@ final class AlipayBillReceiptPayment extends BasePayment implements ReceiptColle
                     $batch['records'] = $this->normalizeBill($data, ['from' => $from, 'to' => $to]);
                     $batch['limit_reached'] = $data['limit_reached'];
                     $state['failures'] = 0;
-                    $delay = (int) $this->config->get('receipt.query_interval_seconds', 3);
+                    $delay = max(
+                        2,
+                        (int) ($group['settings']['receipt_watcher_query_interval_seconds'] ?? 3),
+                    );
                 } catch (ReceiptCollectionException $error) {
                     $state['failures'] = min(10, (int) ($state['failures'] ?? 0) + 1);
                     $delay =
@@ -687,10 +671,7 @@ final class AlipayBillReceiptPayment extends BasePayment implements ReceiptColle
                 continue;
             }
             Money::assertRange($entry['amount_cents']);
-            $paid = DateTimeImmutable::createFromFormat(
-                '!Y-m-d H:i:s',
-                $entry['booked_at'],
-            );
+            $paid = DateTimeImmutable::createFromFormat('!Y-m-d H:i:s', $entry['booked_at']);
             if (!$paid || $paid->format('Y-m-d H:i:s') !== $entry['booked_at']) {
                 throw new ReceiptCollectionException('protocol_error', null, [
                     'stage' => '解析流水',
@@ -706,6 +687,7 @@ final class AlipayBillReceiptPayment extends BasePayment implements ReceiptColle
             $records[] = [
                 'pay_type' => 'alipay',
                 'event_key' => $entry['alipay_order_no'],
+                'raw' => $entry['raw'],
                 'trade_no' => $entry['alipay_order_no'],
                 'amount' => $entry['amount_cents'],
                 'paid_at' => $entry['booked_at'],

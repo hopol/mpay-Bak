@@ -59,6 +59,14 @@ final class ShouQianBaReceiptPayment extends BasePayment implements ReceiptColle
             ],
             [
                 'type' => 'number',
+                'field' => 'receipt_watcher_query_interval_seconds',
+                'title' => '账号查询间隔（秒）',
+                'validate' => [0 => 'require', 'between' => [2, 300]],
+                'value' => 3,
+                'help' => '同账号正常查询结束后的等待时间；失败仍按插件退避，不影响付款有效期。',
+            ],
+            [
+                'type' => 'number',
                 'field' => 'amount_offset_max',
                 'title' => '金额偏移上限（分）',
                 'validate' => [0 => 'require', 'between' => [0, 99]],
@@ -405,25 +413,32 @@ final class ShouQianBaReceiptPayment extends BasePayment implements ReceiptColle
                 continue;
             }
             $paid = strtotime($record['paid_at']);
-            usort(
-                $candidates,
-                static fn(array $a, array $b): int => abs(
-                    $prepared[$a['pay_no']]['requested_at'] - $paid,
-                ) <=> abs($prepared[$b['pay_no']]['requested_at'] - $paid) ?:
-                strcmp($a['created_at'], $b['created_at']) ?:
-                strlen($a['id']) <=> strlen($b['id']) ?:
-                strcmp($a['id'], $b['id']),
-            );
             $pay = $candidates[0];
+            // 只需最优候选，不对整组排序；同距时仍按创建时间和完整 ID 决定。
+            foreach ($candidates as $candidate) {
+                $comparison =
+                    abs($prepared[$candidate['pay_no']]['requested_at'] - $paid) <=>
+                    abs($prepared[$pay['pay_no']]['requested_at'] - $paid) ?:
+                    strcmp($candidate['created_at'], $pay['created_at']) ?:
+                    strlen($candidate['id']) <=> strlen($pay['id']) ?:
+                    strcmp($candidate['id'], $pay['id']);
+                if ($comparison < 0) {
+                    $pay = $candidate;
+                }
+            }
             $meta = $prepared[$pay['pay_no']]['meta'];
             $used[$pay['pay_no']] = true;
             $results[] = [
                 'status' => 'success',
                 'pay_no' => $pay['pay_no'],
                 'paid_amount' => $meta['original_amount'],
-                'chan_order_no' => $record['trade_no'],
+                'chan_order_no' => $record['trade_no'] ?? $record['event_key'],
                 'chan_trade_no' => $record['trade_no'],
-                'receipt' => $record,
+                'pay_type' => $record['pay_type'],
+                'received_amount' => $record['amount'],
+                'paid_at' => $record['paid_at'] ?? $context['received_at'],
+                'event_key' => $record['event_key'],
+                'raw' => $record['raw'],
             ];
         }
         return $results;
@@ -747,7 +762,7 @@ final class ShouQianBaReceiptPayment extends BasePayment implements ReceiptColle
         } finally {
             $state['next_query_at'] =
                 $this->clock->now()->getTimestamp() +
-                (int) $this->config->get('receipt.query_interval_seconds', 3);
+                max(2, (int) ($settings['receipt_watcher_query_interval_seconds'] ?? 3));
             // 最终查询时间、失败等待及范围变化仍逐次持久化，重启不会重置退避。
             if ($state !== $persisted) {
                 $store->set('shouqianba.account.' . $key, $state, 0);
@@ -850,6 +865,7 @@ final class ShouQianBaReceiptPayment extends BasePayment implements ReceiptColle
             $records[] = [
                 'pay_type' => $type,
                 'event_key' => $row['order_sn'],
+                'raw' => $row,
                 'trade_no' => $row['order_sn'],
                 'amount' => (int) $amount,
                 'paid_at' => $paid->format('Y-m-d H:i:s'),

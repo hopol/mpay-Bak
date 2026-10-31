@@ -100,15 +100,18 @@ final class CashierService extends BaseService
                 : ($state['can_pay']
                     ? $pay->receiptAmount()
                     : null);
+        $methods = $state['can_select']
+            ? $this->paymentMethods($biz['app_id'], (int) $biz['order_amount'])
+            : [];
         return $state + [
             'subject' => $biz['subject'],
             'amount' => $amount === null ? null : Money::format($amount),
             'pay_type' => $type,
             'presentation' => $presentation,
-            'payment_methods' => $state['can_select']
-                ? $this->paymentMethods($biz['app_id'], (int) $biz['order_amount'])
-                : [],
-            'payment_brands' => $this->management->brands(),
+            'payment_methods' => $methods,
+            'payment_brands' => $this->management->brands(
+                $type === null ? array_column($methods, 'code') : [$type],
+            ),
             'test_mode' =>
                 ($pay['ext_json']['personal_receipt']['test_only'] ?? false) === true ||
                 $this->config->get('mpay.environment') === 'testing',
@@ -249,11 +252,13 @@ final class CashierService extends BaseService
             throw new RuntimeException('订单返回地址缺少通知责任');
         }
         $result['action'] = $hasReturn ? 'return' : 'success';
-        $result['next_url'] =
-            '/cashier/' .
-            $result['action'] .
-            '?' .
-            http_build_query(['biz_no' => $biz['biz_no'], 'token' => $accessToken]);
+        $result['next_url'] = (string) url('cashier.' . $result['action'], [
+            'biz_no' => $biz['biz_no'],
+            'token' => $accessToken,
+        ])
+            ->suffix(false)
+            ->domain(false)
+            ->root('');
         return $result;
     }
 
@@ -433,22 +438,13 @@ final class CashierService extends BaseService
      */
     private function paymentMethods(string $appId, int $amount): array
     {
-        $app = $this->apps->lock($appId);
+        $app = $this->apps->find($appId) ?? throw new RuntimeException('应用不存在');
         if ((int) $app['status'] !== 1) {
             return [];
         }
         $methods = [];
         $types = $this->catalog->enabledTypes();
-        // 多方式预览在同一事务内，锁序不跟随可编辑的显示顺序。
-        usort(
-            $types,
-            static fn($a, $b): int => strlen($a['id']) <=> strlen($b['id']) ?:
-            strcmp($a['id'], $b['id']),
-        );
-        // 先锁齐各方式，再接触可能跨方式复用的插件配置，避免预览反向等待通道编辑。
-        foreach ($types as $type) {
-            $this->catalog->find($type['id'], true);
-        }
+        // 仅展示当前可申请的方式；用户真正选择时再在建单事务内加锁选路。
         foreach ($types as $type) {
             try {
                 $this->routes->selectFor($appId, $amount, $type['code'], false);
